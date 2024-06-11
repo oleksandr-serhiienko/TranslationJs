@@ -1,6 +1,7 @@
 const axios = require('axios')
 const { getRandom } = require('random-useragent')
 const { load } = require('cheerio')
+const puppeteer = require('puppeteer');
 
 const available = require('./languages/available.js')
 const compatibility = require('./languages/compatibility.js')
@@ -62,8 +63,9 @@ module.exports = class Reverso {
      * @param cb {function}
      * @returns {Promise<{ok: boolean, message: string}|{examples: {id: number, source: string, target: string}[], translations: string[], text, source: string, ok: boolean, target: string}>}
      */
-    async getContext(
+    async getContextByTranslation(
         text,
+        selectedTranslation,
         source = SupportedLanguages.ENGLISH,
         target = SupportedLanguages.RUSSIAN,
         cb = null
@@ -93,17 +95,29 @@ module.exports = class Reverso {
             return error
         }
 
-        const response = await this.#request({
-            method: 'GET',
-            url:
-                this.CONTEXT_URL +
-                [source, target].join('-') +
-                '/' +
-                encodeURIComponent(text).replace(/%20/g, '+'),
-        })
-        if (!response.success) return this.#handleError(response.error, cb)
+        const tst =
+            this.CONTEXT_URL +
+            [source, target].join('-') +
+            '/' +
+            encodeURIComponent(text).replace(/%20/g, '+') + '#' + selectedTranslation
 
-        const $ = load(response.data)
+        // Launch Puppeteer
+        const browser = await puppeteer.launch();
+        const page = await browser.newPage();
+        const url = tst;
+
+        // Set a random user-agent to mimic a real browser
+        await page.setUserAgent(getRandom());
+
+        // Navigate to the URL with the fragment
+        await page.goto(url);
+        await page.waitForSelector('#filtered-entry');
+        const content = await page.content();
+
+        // Close the browser
+        await browser.close();
+
+        const $$ = load(content)
         const sourceDirection =
             source === SupportedLanguages.ARABIC
                 ? `rtl ${SupportedLanguages.ARABIC}`
@@ -117,43 +131,187 @@ module.exports = class Reverso {
                 ? 'rtl'
                 : 'ltr'
 
-        const sourceExamples = $(
+        // Function to remove <a> tags but keep their inner content
+        function removeOuterATag(html) {
+            const $content = load(html);
+            $content('a').each((i, el) => {
+                const innerHtml = $content(el).html();
+                $content(el).replaceWith(innerHtml);
+            });
+            return $content.html();
+        }
+
+        // Function to extract content inside <body> tag
+        function extractBodyContent(html) {
+            const $content = load(html);
+            return $content('body').html();
+        }
+
+        const sourceExamples = $$(
             `.example > div.src.${sourceDirection} > span.text`
         )
-            .text()
-            .trim()
-            .split('\n')
-        const targetExamples = $(
-            `.example > div.trg.${targetDirection} > span.text`
-        )
-            .text()
-            .trim()
-            .split('\n')
-        const targetTranslations = $('#translations-content > div')
-            .text()
-            .trim()
-            .split('\n')
+            .map((i, el) => $$(el).html().trim())
+            .get();
+
+        const targetExamples = $$(`.example > div.trg.${targetDirection} > span.text`)
+            .map((i, el) => {
+                const html = $$(el).html().trim();
+                const cleanedHtml = removeOuterATag(html);
+                return extractBodyContent(cleanedHtml);
+            })
+            .get();
 
         const examples = sourceExamples.map((e, i) => ({
             id: i,
             source: e.trim(),
             target: targetExamples[i].trim(),
         }))
-        const translations = targetTranslations.map((e) => e.trim())
 
         const result = {
             ok: true,
             text,
             source,
             target,
-            translations,
-            examples,
+            examples
         }
 
         if (cb) cb(null, result)
 
         return result
     }
+
+        /**
+     * Get context examples of the query.
+     * @public
+     * @param text {string}
+     * @param source {'arabic' | 'german' | 'spanish' | 'french' | 'hebrew' | 'italian' | 'japanese' | 'dutch' | 'polish' | 'portuguese' | 'romanian' | 'russian' | 'turkish' | 'chinese' | 'english' | 'swedish'}
+     * @param target {'arabic' | 'german' | 'spanish' | 'french' | 'hebrew' | 'italian' | 'japanese' | 'dutch' | 'polish' | 'portuguese' | 'romanian' | 'russian' | 'turkish' | 'chinese' | 'english' | 'swedish'}
+     * @param cb {function}
+     * @returns {Promise<{ok: boolean, message: string}|{examples: {id: number, source: string, target: string}[], translations: string[], text, source: string, ok: boolean, target: string}>}
+     */
+        async getContext(
+            text,
+            source = SupportedLanguages.ENGLISH,
+            target = SupportedLanguages.RUSSIAN,
+            cb = null
+        ) {
+            source = source.toLowerCase()
+            target = target.toLowerCase()
+    
+            if (cb && typeof cb !== 'function') {
+                return {
+                    ok: false,
+                    message: 'getContext: cb parameter must be type of function',
+                }
+            }
+    
+            if (
+                !compatibility.context
+                    .find((e) => e.name === source)
+                    ?.compatible_with.includes(target)
+            ) {
+                const error = {
+                    ok: false,
+                    message: 'getContext: invalid language passed to the method',
+                }
+    
+                if (cb) cb(error)
+    
+                return error
+            }
+            const test = this.CONTEXT_URL +
+                        [source, target].join('-') +
+                        '/' +
+                        encodeURIComponent(text).replace(/%20/g, '+') 
+
+            const response = await this.#request({
+                method: 'GET',
+                url:
+                    this.CONTEXT_URL +
+                    [source, target].join('-') +
+                    '/' +
+                    encodeURIComponent(text).replace(/%20/g, '+') 
+            })
+            if (!response.success) return this.#handleError(response.error, cb)
+    
+            const $ = load(response.data)
+            const sourceDirection =
+                source === SupportedLanguages.ARABIC
+                    ? `rtl ${SupportedLanguages.ARABIC}`
+                    : source === SupportedLanguages.HEBREW
+                    ? 'rtl'
+                    : 'ltr'
+            const targetDirection =
+                target === 'arabic'
+                    ? `rtl ${SupportedLanguages.ARABIC}`
+                    : target === SupportedLanguages.HEBREW
+                    ? 'rtl'
+                    : 'ltr'
+    
+            // Function to remove <a> tags but keep their inner content
+            function removeOuterATag(html) {
+                const $content = load(html);
+                $content('a').each((i, el) => {
+                    const innerHtml = $content(el).html();
+                    $content(el).replaceWith(innerHtml);
+                });
+                return $content.html();
+            }
+    
+            // Function to extract content inside <body> tag
+            function extractBodyContent(html) {
+                const $content = load(html);
+                return $content('body').html();
+            }
+    
+            const sourceExamples = $(
+                `.example > div.src.${sourceDirection} > span.text`
+            )
+                .map((i, el) => $(el).html().trim())
+                .get();
+    
+            const targetExamples = $(`.example > div.trg.${targetDirection} > span.text`)
+                .map((i, el) => {
+                    const html = $(el).html().trim();
+                    const cleanedHtml = removeOuterATag(html);
+                    return extractBodyContent(cleanedHtml);
+                })
+                .get();
+            
+            const targetTranslations = $('#translations-content a.translation')
+                .map((i, el) => {
+                    const term = $(el).find('span.display-term').text()?.trim();
+                    const gender = $(el).find('div.pos-mark span').attr('title')?.trim()
+                    return {
+                        Translation: term,
+                        Type: gender
+                    };
+                })
+                .get();
+                
+    
+            const examples = sourceExamples.map((e, i) => ({
+                id: i,
+                source: e.trim(),
+                target: targetExamples[i].trim(),
+            }))
+            const translations = targetTranslations
+    
+            const result = {
+                ok: true,
+                text,
+                source,
+                target,
+                translations,
+                examples,
+            }
+    
+            if (cb) cb(null, result)
+    
+            return result
+        }
+
+
 
     /**
      * Get spell check of the query.
